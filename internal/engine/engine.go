@@ -53,10 +53,17 @@ type Controller struct {
 	gen uint64
 
 	// expired is the set of account ids rendered as expired (all traffic dropped)
-	// by the most recent Apply. The expiry loop compares it against the wall
+	// by the most recent Apply. The sync loop compares it against the wall
 	// clock and reconciles as soon as an account's expiry passes, so the kernel
 	// drop is installed within one sample interval of the deadline.
 	expired map[int64]bool
+
+	// unsynced is set when a reconcile wrote its mutation to SQLite but the
+	// kernel apply then failed. c.snap still follows SQLite (the desired state),
+	// and the sync loop keeps retrying the apply until the kernel matches, so a
+	// persisted change — e.g. a passed expiry — can never be silently left
+	// unenforced until the next unrelated mutation or a restart.
+	unsynced bool
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -187,7 +194,7 @@ func (c *Controller) Start() {
 	c.wg.Add(1)
 	go c.persistLoop()
 	c.wg.Add(1)
-	go c.expiryLoop()
+	go c.syncLoop()
 }
 
 // Stop halts background loops (and performs a final persist).
@@ -377,9 +384,15 @@ func (c *Controller) reconcile(mutate func() error) error {
 		return err
 	}
 	if err := c.applyLocked(&snap); err != nil {
-		return fmt.Errorf("apply: %w", err)
+		// The mutation is already in SQLite. Keep the in-memory desired state in
+		// step with it and let syncLoop retry the kernel apply, rather than leave
+		// c.snap describing a state the database no longer holds.
+		c.snap = snap
+		c.unsynced = true
+		return fmt.Errorf("apply (change saved; the kernel apply will be retried): %w", err)
 	}
 	c.snap = snap
+	c.unsynced = false
 	// This rebuild reseeded the kernel's quota/counter values, so any sample the
 	// sampleLoop took before now is stale: bump the generation to discard it.
 	c.gen++
@@ -584,10 +597,11 @@ func (c *Controller) SetExpiry(id int64, expiresUnix int64) error {
 	})
 }
 
-// expiryLoop watches for accounts whose expiry passes (or, after a clock jump,
-// un-passes) and reconciles so the kernel ruleset matches. The check is a cheap
-// in-memory comparison; a reconcile only happens when the expired set changes.
-func (c *Controller) expiryLoop() {
+// syncLoop keeps the kernel ruleset in step with the desired state over time:
+// it reconciles when an account's expiry passes (or, after a clock jump,
+// un-passes), and retries a reconcile whose kernel apply failed. The check is a
+// cheap in-memory comparison; a reconcile only happens when one is needed.
+func (c *Controller) syncLoop() {
 	defer c.wg.Done()
 	t := time.NewTicker(c.sampleInterval)
 	defer t.Stop()
@@ -596,18 +610,19 @@ func (c *Controller) expiryLoop() {
 		case <-c.stopCh:
 			return
 		case <-t.C:
-			c.runDueExpiries()
+			c.syncKernel()
 		}
 	}
 }
 
-// runDueExpiries re-applies the ruleset if the set of expired accounts at the
-// current time differs from what the kernel was last given.
-func (c *Controller) runDueExpiries() {
+// syncKernel re-applies the ruleset if the kernel is behind the desired state:
+// a previous apply failed, or the set of expired accounts at the current time
+// differs from what the kernel was last given.
+func (c *Controller) syncKernel() {
 	now := time.Now()
 	c.mu.Lock()
 	var newly []string
-	changed := false
+	changed := c.unsynced
 	for _, a := range c.snap.Accounts {
 		exp := a.ExpiredAt(now)
 		if exp != c.expired[a.ID] {
@@ -622,7 +637,7 @@ func (c *Controller) runDueExpiries() {
 		return
 	}
 	if err := c.reconcile(func() error { return nil }); err != nil {
-		c.logf("apply expiry: %v", err)
+		c.logf("kernel resync: %v", err)
 		return
 	}
 	for _, name := range newly {

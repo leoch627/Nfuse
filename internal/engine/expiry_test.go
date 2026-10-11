@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -56,7 +57,7 @@ func TestSetExpiryPastDisablesImmediately(t *testing.T) {
 }
 
 // TestExpiryLoopAppliesWhenDeadlinePasses: a future expiry leaves the account
-// live; once the wall clock passes it, runDueExpiries reconciles and the kernel
+// live; once the wall clock passes it, syncKernel reconciles and the kernel
 // is handed the expired rendering. A second check with nothing changed is a no-op.
 func TestExpiryLoopAppliesWhenDeadlinePasses(t *testing.T) {
 	ctrl, mgr, _ := newTestEngine(t)
@@ -74,20 +75,20 @@ func TestExpiryLoopAppliesWhenDeadlinePasses(t *testing.T) {
 		t.Fatal("account expired before its deadline")
 	}
 	applies := len(mgr.applied)
-	ctrl.runDueExpiries()
+	ctrl.syncKernel()
 	if len(mgr.applied) != applies {
-		t.Fatal("runDueExpiries reconciled although nothing changed")
+		t.Fatal("syncKernel reconciled although nothing changed")
 	}
 
 	time.Sleep(time.Until(time.Unix(expires, 0)) + 50*time.Millisecond)
-	ctrl.runDueExpiries()
+	ctrl.syncKernel()
 	if len(mgr.applied) != applies+1 {
-		t.Fatalf("runDueExpiries should reconcile once after the deadline (applies %d -> %d)", applies, len(mgr.applied))
+		t.Fatalf("syncKernel should reconcile once after the deadline (applies %d -> %d)", applies, len(mgr.applied))
 	}
 	if !viewOf(t, ctrl, id).Expired {
 		t.Fatal("account should be expired after the deadline")
 	}
-	ctrl.runDueExpiries()
+	ctrl.syncKernel()
 	if len(mgr.applied) != applies+1 {
 		t.Fatal("a second check after expiry must not reconcile again")
 	}
@@ -141,5 +142,54 @@ func TestColdStartRendersPastExpiry(t *testing.T) {
 	}
 	if !viewOf(t, ctrl, id).Expired {
 		t.Fatal("view should report the account expired after startup")
+	}
+}
+
+// TestFailedApplyIsRetried: if the kernel apply fails after SetExpiry has
+// written SQLite, the persisted deadline must not be left unenforced. The
+// in-memory state keeps following SQLite, the view stays truthful (the kernel
+// is not blocking yet), and the next sync retries the apply until it succeeds.
+func TestFailedApplyIsRetried(t *testing.T) {
+	ctrl, mgr, st := newTestEngine(t)
+	id, err := ctrl.AddAccount("alice", model.TierOneShot, 1, 1)
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	past := time.Now().Add(-time.Hour).Unix()
+	mgr.applyErr = errors.New("netlink: transient failure")
+	if err := ctrl.SetExpiry(id, past); err == nil {
+		t.Fatal("SetExpiry should report the failed kernel apply")
+	}
+	snap, _ := st.Load()
+	if a, _ := snap.Account(id); a.ExpiresUnix != past {
+		t.Fatalf("expiry should be saved despite the failed apply, got %d", a.ExpiresUnix)
+	}
+	if v := viewOf(t, ctrl, id); v.Account.ExpiresUnix != past || v.Expired {
+		t.Fatalf("view = expires %d expired %v; want the saved deadline, not yet enforced", v.Account.ExpiresUnix, v.Expired)
+	}
+
+	// Still failing: the retry must not clear the pending state.
+	ctrl.syncKernel()
+	if viewOf(t, ctrl, id).Expired {
+		t.Fatal("account reported expired although no apply succeeded")
+	}
+
+	// The kernel recovers: the next sync applies the expiry.
+	mgr.applyErr = nil
+	applies := len(mgr.applied)
+	ctrl.syncKernel()
+	if len(mgr.applied) != applies+1 {
+		t.Fatalf("sync should retry the failed apply once (applies %d -> %d)", applies, len(mgr.applied))
+	}
+	if a, _ := mgr.lastApplied().Account(id); a.ExpiresUnix != past {
+		t.Fatalf("retried apply carried expiry %d, want %d", a.ExpiresUnix, past)
+	}
+	if !viewOf(t, ctrl, id).Expired {
+		t.Fatal("account should be blocked once the retried apply succeeds")
+	}
+	ctrl.syncKernel()
+	if len(mgr.applied) != applies+1 {
+		t.Fatal("no further reconcile once the kernel is back in sync")
 	}
 }
