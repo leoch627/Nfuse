@@ -91,6 +91,7 @@ main() {
     fi
     [ "$(uname -s)" = "Linux" ] || die "Nfuse 仅支持 Linux"
     command -v systemctl >/dev/null 2>&1 || die "需要 systemd（未找到 systemctl）"
+    command -v sha256sum >/dev/null 2>&1 || die "需要 sha256sum 来校验下载文件（请安装 coreutils）"
 
     check_kernel
     local arch iface base asset
@@ -115,13 +116,13 @@ main() {
     asset="nfuse-${arch}.tar.gz"
     echo "正在下载最新版 Nfuse..."
     fetch "$base/$asset" "$tmp/$asset"
-    if command -v sha256sum >/dev/null 2>&1 && fetch "$base/SHA256SUMS.txt" "$tmp/SHA256SUMS.txt"; then
-        echo "正在校验 SHA256..."
-        (cd "$tmp" && grep " ${asset}\$" SHA256SUMS.txt | sha256sum -c --quiet -) ||
-            die "$asset 校验和不匹配，已中止"
-    else
-        echo "警告：跳过校验和验证"
-    fi
+    # 校验失败即中止：脚本以 root 运行，且每个 Release 都发布 SHA256SUMS.txt，
+    # 因此无法验证的二进制一律不安装。
+    echo "正在校验 SHA256..."
+    fetch "$base/SHA256SUMS.txt" "$tmp/SHA256SUMS.txt" ||
+        die "无法下载 SHA256SUMS.txt，拒绝安装未经校验的二进制"
+    (cd "$tmp" && grep " ${asset}\$" SHA256SUMS.txt | sha256sum -c --quiet -) ||
+        die "$asset 校验失败，已中止"
 
     echo "正在安装 Nfuse 到 $BIN..."
     tar -xzf "$tmp/$asset" -C "$tmp" nfuse
@@ -153,17 +154,18 @@ EOF
     echo "设置 Nfuse 开机自启并（重新）启动..."
     systemctl enable nfuse >/dev/null
     # 用 restart 而非 `enable --now`：升级时旧二进制仍在运行。
-    systemctl restart nfuse || true
+    # 服务启动失败（或立即崩溃重启）时安装脚本以非零退出，避免自动化误判成功。
+    if ! systemctl restart nfuse || ! { sleep 2; systemctl is-active --quiet nfuse; }; then
+        echo >&2
+        echo "错误：Nfuse 已安装，但服务启动失败。最近的日志：" >&2
+        journalctl -u nfuse -n 20 --no-pager >&2 || true
+        echo "排查：systemctl status nfuse / journalctl -u nfuse -f" >&2
+        exit 1
+    fi
 
-    sleep 2
     echo
     echo "========================================="
-    if systemctl is-active --quiet nfuse; then
-        echo "Nfuse 安装完成！（$("$BIN" version 2>/dev/null || echo nfuse)）"
-    else
-        echo "Nfuse 已安装，但服务尚未运行，"
-        echo "请用下面的命令查看日志。"
-    fi
+    echo "Nfuse 安装完成！（$("$BIN" version 2>/dev/null || echo nfuse)）"
     echo "网卡：${iface}"
     echo
     echo "查看状态："

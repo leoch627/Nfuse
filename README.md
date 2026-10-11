@@ -37,10 +37,11 @@ curl -fsSL https://gitd.uh.ink/https://github.com/sketchain/Nfuse/raw/refs/heads
 
 - 检查 root、Linux、systemd 以及内核 **≥ 5.16**，不满足时直接报错退出；
 - 自动识别 CPU 架构（amd64 / arm64 / armv7 / 386）并下载对应的 Release 包，用
-  `SHA256SUMS.txt` 校验后安装到 `/usr/local/bin/nfuse`；
+  `SHA256SUMS.txt` 校验后安装到 `/usr/local/bin/nfuse`——校验文件下载不到或校验不通过时
+  **直接中止**，绝不安装未经验证的二进制；
 - 缺少 `nft` 时通过 apt / dnf / yum / zypper / pacman 自动安装 nftables；
 - 取默认路由（IPv4，没有则 IPv6）所在网卡生成 `/etc/systemd/system/nfuse.service`，
-  并设为开机自启、立即启动。
+  并设为开机自启、立即启动；服务启动失败时打印最近日志并以 **非零** 退出（便于自动化判断）。
 
 **指定网卡：** 自动识别不准时用 `NFUSE_IFACE` 指定（`ip -br link` 查看网卡名）：
 
@@ -199,7 +200,9 @@ sudo nfuse set-expire vip never                               # 取消到期，�
   `never` 会立即恢复，**用量与计数器完整保留**（停用时 quota/counter 对象仍然存在，只是
   不再被规则引用）。
 - **执行方式：** 守护进程每个采样周期（默认 2 秒）检查一次，一旦有账户到期就走同一条
-  原子对账路径重建规则集，因此 drop 规则会在到期后约 2 秒内装进内核。守护进程启动时也会
+  原子对账路径重建规则集，因此 drop 规则会在到期后约 2 秒内装进内核。若某次内核应用失败
+  （例如瞬时的 nft/netlink 错误），已保存到 SQLite 的变更不会丢：守护进程会在之后每个
+  周期自动重试，直到内核与期望状态一致。守护进程启动时也会
   按当前时间渲染规则，所以宕机期间到期的账户在服务恢复的第一时间就被停用。
 - **档位 c 不会到期：** 不限量账户拒绝设置到期日。把一个带到期日的 a/b 账户切到 c 时，
   到期日会保留但暂不生效（与用量的“暂停”语义一致），切回 a/b 后重新生效。
@@ -444,10 +447,13 @@ The installer:
   error if any is missing;
 - detects the CPU architecture (amd64 / arm64 / armv7 / 386), downloads the
   matching release asset, verifies it against `SHA256SUMS.txt` and installs it as
-  `/usr/local/bin/nfuse`;
+  `/usr/local/bin/nfuse`. If the checksum file can't be fetched or doesn't
+  match, it **aborts**: an unverified binary is never installed;
 - installs nftables via apt / dnf / yum / zypper / pacman if `nft` is missing;
 - writes `/etc/systemd/system/nfuse.service` for the default-route interface
-  (IPv4, falling back to IPv6), enables it at boot and starts it.
+  (IPv4, falling back to IPv6), enables it at boot and starts it. If the service
+  fails to start, it prints the recent logs and exits **non-zero**, so automation
+  can tell.
 
 **Choosing the interface:** if auto-detection picks the wrong NIC, set
 `NFUSE_IFACE` (see `ip -br link`):
@@ -634,7 +640,10 @@ sudo nfuse set-expire vip never                               # remove the expir
   counter objects stay declared while expired, just unreferenced by any rule.
 - **Enforcement:** the daemon checks once per sample interval (2 s by default).
   When an account expires it rebuilds the ruleset through the same atomic
-  reconcile path, so the drop is in the kernel within ~2 s of the deadline.
+  reconcile path, so the drop is in the kernel within ~2 s of the deadline. If a
+  kernel apply fails (say, a transient nft/netlink error), the change already
+  saved to SQLite is not lost: the daemon retries every interval until the
+  kernel matches.
   Startup renders the ruleset against the current time too, so an account that
   expired while the daemon was down is blocked as soon as it comes back.
 - **Tier c never expires:** an unlimited account rejects an expiry. Switching

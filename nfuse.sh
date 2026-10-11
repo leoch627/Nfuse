@@ -94,6 +94,7 @@ main() {
     fi
     [ "$(uname -s)" = "Linux" ] || die "Nfuse only runs on Linux"
     command -v systemctl >/dev/null 2>&1 || die "systemd is required (systemctl not found)"
+    command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required to verify the download (install coreutils)"
 
     check_kernel
     local arch iface base asset
@@ -118,13 +119,13 @@ main() {
     asset="nfuse-${arch}.tar.gz"
     echo "Downloading the latest version of Nfuse..."
     fetch "$base/$asset" "$tmp/$asset"
-    if command -v sha256sum >/dev/null 2>&1 && fetch "$base/SHA256SUMS.txt" "$tmp/SHA256SUMS.txt"; then
-        echo "Verifying checksum..."
-        (cd "$tmp" && grep " ${asset}\$" SHA256SUMS.txt | sha256sum -c --quiet -) ||
-            die "checksum mismatch for $asset; aborting"
-    else
-        echo "Warning: skipping checksum verification"
-    fi
+    # Fail closed: this runs as root, and every release publishes SHA256SUMS.txt,
+    # so a binary that cannot be verified is never installed.
+    echo "Verifying checksum..."
+    fetch "$base/SHA256SUMS.txt" "$tmp/SHA256SUMS.txt" ||
+        die "could not download SHA256SUMS.txt; refusing to install an unverified binary"
+    (cd "$tmp" && grep " ${asset}\$" SHA256SUMS.txt | sha256sum -c --quiet -) ||
+        die "checksum verification failed for $asset; aborting"
 
     echo "Installing Nfuse to $BIN..."
     tar -xzf "$tmp/$asset" -C "$tmp" nfuse
@@ -156,17 +157,19 @@ EOF
     echo "Enabling Nfuse at boot and (re)starting it..."
     systemctl enable nfuse >/dev/null
     # restart, not `enable --now`: on an upgrade the old binary is still running.
-    systemctl restart nfuse || true
+    # A service that fails to start (or crash-loops right away) fails the
+    # installer with a non-zero exit, so automation never sees a false success.
+    if ! systemctl restart nfuse || ! { sleep 2; systemctl is-active --quiet nfuse; }; then
+        echo >&2
+        echo "Error: Nfuse was installed but the service failed to start. Recent logs:" >&2
+        journalctl -u nfuse -n 20 --no-pager >&2 || true
+        echo "Check: systemctl status nfuse / journalctl -u nfuse -f" >&2
+        exit 1
+    fi
 
-    sleep 2
     echo
     echo "========================================="
-    if systemctl is-active --quiet nfuse; then
-        echo "Nfuse installation complete! ($("$BIN" version 2>/dev/null || echo nfuse))"
-    else
-        echo "Nfuse was installed but the service is not running yet;"
-        echo "check the logs below."
-    fi
+    echo "Nfuse installation complete! ($("$BIN" version 2>/dev/null || echo nfuse))"
     echo "Interface: ${iface}"
     echo
     echo "To check the program running status:"
